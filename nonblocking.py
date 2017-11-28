@@ -6,6 +6,7 @@ import logging
 import struct
 
 from collections import deque
+from urlparse import urlparse
 
 from tornado.ioloop import IOLoop
 from tornado.tcpclient import TCPClient
@@ -156,7 +157,11 @@ class HadoopRPC(object):
 		header.callId = -3
 		header.rpcKind = RpcHeader_pb2.RPC_PROTOCOL_BUFFER
 		header.rpcOp = RpcHeader_pb2.RpcRequestHeaderProto.RPC_FINAL_PACKET
-		header.clientId = 'hrpc-client'
+		# clientid should be 16 bytes long ...
+		# see org.apache.hadoop.ipc.RetryCache
+		# at least namenode rpc enforce this.
+		# or simply set it to empty
+		header.clientId = 'hrpc-client-next'
 		return header
 	
 	def _varint(self,value):
@@ -231,7 +236,7 @@ class MultiRPC(object):
 			except StreamClosedError:
 				logging.info('stream closed,retry...')
 				continue
-			else:
+			except:
 				yield active.close()
 				logging.exception('why')
 			
@@ -379,7 +384,7 @@ class Namenode(MultiRPC):
 		
 		ok,response = response
 		if not ok and response.exceptionClassName == 'org.apache.hadoop.ipc.StandbyException':
-			logging.info('ha switch')
+			logging.info('namenode ha switch...')
 			return True
 		return False
 	
@@ -396,14 +401,97 @@ class Namenode(MultiRPC):
 			response,
 		)
 		
+		if ok and response.fs.fileId != 0:
+			raise gen.Return(response)	
+		raise gen.Return(None)
+	
+	@gen.coroutine
+	def blocks(self,path,offset,length):
+		request = ClientNamenodeProtocol_pb2.GetBlockLocationsRequestProto()
+		request.src = path
+		request.offset = offset
+		request.length = length
+	
+		response = ClientNamenodeProtocol_pb2.GetBlockLocationsResponseProto()
+		ok,response = yield self.call(
+			self._protocol,
+			'getBlockLocations',
+			request,
+			response,
+		)
+		
 		raise gen.Return(response if ok else None)
 
+	@gen.coroutine
+	def list_dirs(self,path,after_child='',location=False):
+		request = ClientNamenodeProtocol_pb2.GetListingRequestProto()
+		request.src = path
+		request.startAfter = after_child
+		request.needLocation = location
+	
+		response = ClientNamenodeProtocol_pb2.GetListingResponseProto()
+		ok,response = yield self.call(
+			self._protocol,
+			'getListing',
+			request,
+			response,
+		)
+		
+		raise gen.Return(response if ok else None)	
+	
+	@gen.coroutine	
+	def mkdirs(self,path,permission=0x777):
+		request = ClientNamenodeProtocol_pb2.MkdirsRequestProto()
+		request.src = path
+		request.createParent = True
+		request.masked.perm = permission
 
+		response = ClientNamenodeProtocol_pb2.MkdirsResponseProto()
+		ok,response = yield self.call(
+			self._protocol,
+			'mkdirs',
+			request,
+			response,
+		)
+		
+		raise gen.Return(response if ok else None)
+	
+	@gen.coroutine
+	def move(self,source,destination,force=False):
+		request = ClientNamenodeProtocol_pb2.Rename2RequestProto()
+		request.src = source
+		request.dst = destination
+		request.moveToTrash = True
+		request.overwriteDest = force
+	
+		response = ClientNamenodeProtocol_pb2.Rename2ResponseProto()
+		ok,response = yield self.call(
+			self._protocol,
+			'rename2',
+			request,
+			response,
+		)
+		if not ok:
+			logging.warn(response)
+		raise gen.Return(response if ok else None)	
 
-
-
-
-
+class Namenodes(object):
+	
+	def __init__(self,namenodes):
+		super(Namenodes,self).__init__()
+		self._namenodes = namenodes	
+	
+	def resolve(self,path):
+		path = urlparse(path)
+		if path.scheme != 'hdfs':
+			return None
+		
+		name_service = path.netloc.split(':')[0]	
+		namenode = self._namenodes.get(name_service,None)
+		if namenode is None:
+			return None
+		
+		return namenode
 
 
 
