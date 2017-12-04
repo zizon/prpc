@@ -16,7 +16,7 @@ from nonblocking import MRClient
 from nonblocking import Namenode
 from nonblocking import Namenodes
 
-from futures import Delays
+from gen import hdfs_pb2
 
 logging.basicConfig(level=logging.INFO,format=u'%(asctime)s [%(levelname)s] (%(name)s) {%(pathname)s:%(lineno)d@%(funcName)s} -  %(message)s')
 
@@ -144,28 +144,32 @@ def audit_mr_jobs(mr_history,yarn,namenodes):
 
 @gen.coroutine
 def clean_hive_staging_dir(namenodes,dirs):
+	now = int((datetime.now() - datetime(1970,1,1)).total_seconds() * 1000)
+	logging.info('trigger clean_hive_staging_dir... %s' % datetime.fromtimestamp(now/1000))
 	for candidate in dirs:
 		namenode = namenodes.resolve(candidate)
 		if namenode is None:
 			logging.warn('no namenode for file:%s' % candidate)
 			raise gen.Return()
-
 		url = urlparse(candidate)
-		children = map(
-			lambda x:'%s/%s' % (
+		
+		@gen.coroutine	
+		def each(entry):
+			if not os.path.split(entry.path)[-1].startswith('.hive-staging_hive'):
+				raise gen.Return()
+
+			full_path = '%s/%s' % (
 				url.path,
-				x.path,
-			),
-			(yield namenode.list_dirs(urlparse(candidate).path)).dirList.partialListing,
-		)
-		map(
-			lambda x:(yield x),
-			map(
-				lambda child:trash(namenode,child),
-				children,
+				entry.path,
 			)
-		)
-	
+			
+			# process older than a day
+			if now - entry.modification_time > (3600 * 24 * 1000):
+				trash(namenode,full_path)
+		
+		# do work
+		yield namenode.list_dirs_all(urlparse(candidate).path,each)
+			
 	IOLoop.current().call_later(5,clean_hive_staging_dir,namenodes,dirs)
 
 @gen.coroutine
@@ -183,19 +187,67 @@ def trash(namenode,candidate):
 	
 	# move last modify 24 hours ago
 	file_info = yield namenode.file_info(candidate)
-	if now - file_info.fs.modification_time < 3600*24*1000:
-		raise gen.Return()
-	
+		
 	target = '%s/%s' % (
 		trash_root,
 		file_name,
 	)
 	response = yield namenode.move(candidate,target,True)
-	logging.info('move %s to %s, done:%s' % (
+	logging.info('move %s to %s, done:%s modify:%s' % (
 		candidate,
 		target,
-		response
+		response,
+		datetime.fromtimestamp(file_info.fs.modification_time/1000),
 	))
+
+@gen.coroutine
+def clean_hive_scratch_dir(self,dirs):
+	now = int((datetime.now() - datetime(1970,1,1)).total_seconds() * 1000)
+	logging.info('trigger clean_hive_scratch_dir... %s' % datetime.fromtimestamp(now/1000))	
+	for candidate in dirs:
+		namenode = namenodes.resolve(candidate)
+		if namenode is None:
+			logging.warn('no namenode for file:%s' % candidate)
+			raise gen.Return()
+		url = urlparse(candidate)
+		
+		@gen.coroutine
+		def each(entry):
+			if entry.path.startswith('.hive-staging'):
+				raise gen.Return()
+
+			full_path = '%s/%s' % (
+				url.path,
+				entry.path,
+			)
+				
+			# remove file
+			if entry.fileType != 1:
+				trash(namenode,full_path)
+				raise gen.Return()
+
+			@gen.coroutine
+			def uuid(child):
+				sample = '0034a069-f4f7-4cdf-855a-c7513a2e8e3f'
+				path = child.path
+				if len(path) != len(sample) and \
+					len(path.split('-')) !=  len(sample.split('-')):
+					raise gen.Return()
+				full = '%s/%s' % (
+					full_path,
+					child.path,
+				)
+				if now - child.modification_time > (3600 * 24 * 1000):
+					# remove
+					trash(namenode,full)
+			# do work
+			yield namenode.list_dirs_all(full_path,uuid)
+		# do work
+		yield namenode.list_dirs_all(urlparse(candidate).path,each)
+	# end for
+
+	IOLoop.current().call_later(5,clean_hive_scratch_dir,namenodes,dirs)
+	pass
 
 if __name__ == '__main__':
 	yarn = Yarn([
@@ -219,12 +271,17 @@ if __name__ == '__main__':
 	})
 	
 	hive_stagings = [
-		'hdfs://sfbdp1/tmp/hive'
+		'hdfs://sfbdp1/tmp/hive',
 	]
-	
+
+	hive_scratch = [
+		'hdfs://sfbdp1/tmp/hive',
+	]	
+			
 	IOLoop.current().add_callback(lambda :move_spark_task(yarn))
 	IOLoop.current().add_callback(lambda :evict_large_spark_task(yarn))
 	IOLoop.current().add_callback(lambda :clean_hive_staging_dir(namenodes,hive_stagings))
+	IOLoop.current().add_callback(lambda :clean_hive_scratch_dir(namenodes,hive_scratch))
 	#IOLoop.current().add_callback(lambda :audit_mr_jobs(mr_history,yarn,namenodes))
 	
 	IOLoop.current().start()

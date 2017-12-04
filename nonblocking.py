@@ -234,7 +234,7 @@ class MultiRPC(object):
 				if not switching:	
 					break
 			except StreamClosedError:
-				logging.info('stream closed,retry...')
+				logging.warn('stream closed,retry...')
 				continue
 			except:
 				yield active.close()
@@ -439,6 +439,24 @@ class Namenode(MultiRPC):
 		
 		raise gen.Return(response if ok else None)	
 	
+	@gen.coroutine
+	def list_dirs_all(self,path,each,location=False):
+		after_child = ''
+		while True:
+			response = yield self.list_dirs(path,after_child,False)
+			if response is None:
+				break
+
+			# gen child
+			for entry in response.dirList.partialListing:
+				# update last
+				after_child = entry.path
+				yield each(entry)
+			
+			# more?
+			if response.dirList.remainingEntries <= 0:
+				break
+			
 	@gen.coroutine	
 	def mkdirs(self,path,permission=0x777):
 		request = ClientNamenodeProtocol_pb2.MkdirsRequestProto()
