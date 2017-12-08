@@ -5,6 +5,7 @@ import logging
 
 import struct
 
+from collections import deque
 from urlparse import urlparse
 
 from tornado import gen
@@ -141,6 +142,37 @@ class Namenode(MultiRPC):
 		if not ok:
 			logging.warn(response)
 		raise gen.Return(response if ok else None)	
+	
+	@gen.coroutine
+	def stream(self,path):
+		file_info = yield self.file_info(path)
+		blocks = deque((yield self.blocks(path,0,file_info.fs.length)).locations.blocks)
+		
+		def next_stream(this,current):
+			logging.info('close one')
+			if current is not None:
+				current.close()
+			
+			# pop one
+			block = blocks.pop()
+			
+			# build datanode
+			hosts = map(
+				lambda x:(x.id.ipAddr,x.id.xferPort),
+				block.locs,
+			)
+			return Datanode(hosts[0]).stream({
+					'block' : block.b.blockId,
+					'pool' : block.b.poolId,
+					'timestamp' : block.b.generationStamp,
+					'length' : block.b.numBytes,
+				})
+		
+		raise gen.Return(_BoundedMultiStream(
+			None,
+			file_info.fs.length,
+			next_stream,
+		))
 
 class Namenodes(object):
 	
@@ -222,13 +254,19 @@ class Datanode(ProtocolBuffer):
 						response,
 				))
 			
-			raise gen.Return(_BoundedMultiPacketStream(stream,block['length']))
+			raise gen.Return(
+				_BoundedMultiStream(
+					stream,
+					block['length'],
+					lambda self,_:_PacketStream(self.stream()),
+				)
+			)
 		except not gen.Return:
 			logging.exception('unexpected io excetion,close stream for%s'%(
 				str(self._host),
 			))
 			stream.close()
-				
+		
 class _PacketStream(ClosableStream):
 	
 	def __init__(self,buffered_stream):
@@ -273,12 +311,15 @@ class _PacketStream(ClosableStream):
 		# flag it
 		self._inited = True
 	
-class _BoundedMultiPacketStream(ClosableStream):
+class _BoundedMultiStream(ClosableStream):
 	
-	def __init__(self,buffered_stream,logical_length):
-		super(_BoundedMultiPacketStream,self).__init__(buffered_stream)
+	def __init__(self,buffered_stream,logical_length,next_stream=None):
+		super(_BoundedMultiStream,self).__init__(buffered_stream)
 		self._remainds = logical_length
-		self._packet = None
+		self._current = None
+		
+		# with argument (self,current_stream)
+		self._next_stream = next_stream
 
 	@gen.coroutine
 	def read(self,hint):
@@ -287,23 +328,28 @@ class _BoundedMultiPacketStream(ClosableStream):
 			raise gen.Return(None)
 		
 		# any packet?
-		if self._packet is None:
-			self._packet = _PacketStream(self._stream)
-		
+		if self._current is None:
+			current = self._next_stream(self,self._current) 			
+			
+			# check if is future
+			# a bit ugly and tricky
+			if isinstance(current,gen.Future):
+				current = yield current
+			self._current = current
+
 		# do read
-		content = yield self._packet.read(hint)
+		content = yield self._current.read(hint)
 		
 		# end of packet?
 		if content is None:
-			self._packet = None
+			self._current = None
 			# drill down
 			raise gen.Return((yield self.read(hint)))
 		
 		# did read something,update trackers
 		self._remainds -= len(content)
 		raise gen.Return(content)
-
-
+		
 
 
 

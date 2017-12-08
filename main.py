@@ -311,32 +311,18 @@ if __name__ == '__main__':
 		
 		job_config_url = urlparse(job_config_url)	
 		info = yield namenode.file_info(job_config_url.path)
-		
-		contents = []
+		logging.info(info)	
 		blocks = yield namenode.blocks(job_config_url.path,0,info.fs.length)
-		for block in blocks.locations.blocks:
-			hosts = map(
-				lambda x:(x.id.ipAddr,x.id.xferPort),
-				block.locs,
-			)
-			for host in hosts:
-				datanode = Datanode(host)
-				stream = yield datanode.stream({
-					'block' : block.b.blockId,
-					'pool' : block.b.poolId,
-					'timestamp' : block.b.generationStamp,
-					'length' : block.b.numBytes,
-				})
-				while True:
-					content = yield stream.read(1024)
-					if content is None:
-						#stream.close()
-						break;
-					contents.append(content)
-				break
+		stream = yield namenode.stream(job_config_url.path)
+		contents = []
+		while True:
+			content = yield stream.read(1024)
+			if content is None:
+				break;
+			contents.append(content)
 		with open('out.xml','w') as f:
 			f.write(''.join(contents))
-		#logging.info(''.join(contents))
+		logging.info(''.join(contents))
 		exit()
 	IOLoop.current().add_callback(callback)
 	IOLoop.current().start()
