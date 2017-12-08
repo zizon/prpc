@@ -6,7 +6,6 @@ import logging
 import struct
 
 from collections import deque
-from urlparse import urlparse
 
 from tornado.ioloop import IOLoop
 from tornado.tcpclient import TCPClient
@@ -17,16 +16,33 @@ from tornado.iostream import StreamClosedError
 from google.protobuf.internal.encoder import _EncodeVarint
 from google.protobuf.internal.decoder import _DecodeVarint32
 
-from gen import ClientNamenodeProtocol_pb2
 from gen import RpcHeader_pb2
 from gen import IpcConnectionContext_pb2
 from gen import ProtobufRpcEngine_pb2
-from gen import yarn_service_protos_pb2
-from gen import yarn_protos_pb2
-from gen import mr_service_protos_pb2
-from gen import ClientNamenodeProtocol_pb2
 
-class HadoopRPC(object):
+class ProtocolBuffer(object):
+	def __init__(self):
+		super(ProtocolBuffer,self).__init__()
+	
+	def _varint(self,value):
+		encoded = []
+		_EncodeVarint(encoded.append,value)
+		return ''.join(encoded)
+	
+	def read_varint32(self,raw,start):
+		return _DecodeVarint32(raw,start)
+	
+
+	def wrap(self,message):
+		message = message.SerializeToString()
+		message = '%s%s' % (
+			self._varint(len(message)),
+			message,
+		)
+		return message
+
+class HadoopRPC(ProtocolBuffer):
+	CLIENT_ID = 'hrpc-client-next'
 	
 	def __init__(self,host,port):
 		super(HadoopRPC,self).__init__()
@@ -107,7 +123,7 @@ class HadoopRPC(object):
 
 			# response header
 			response_header = RpcHeader_pb2.RpcResponseHeaderProto()
-			response_header_length,offest = self._read_varint32(raw,0)
+			response_header_length,offest = self.read_varint32(raw,0)
 			response_header.ParseFromString(raw[offest:offest+response_header_length])
 			
 			call_context = self._callbacks.pop(response_header.callId)
@@ -116,7 +132,7 @@ class HadoopRPC(object):
 			future = call_context[1]
 			if response_header.status == RpcHeader_pb2.RpcResponseHeaderProto.SUCCESS:
 				# response
-				message_header_length,offest = self._read_varint32(raw,offest+response_header_length)
+				message_header_length,offest = self.read_varint32(raw,offest+response_header_length)
 				response.ParseFromString(raw[offest:offest+message_header_length])
 				future.set_result((True,response))
 			else:
@@ -126,9 +142,6 @@ class HadoopRPC(object):
 		except StreamClosedError:
 			pass
 
-	def _read_varint32(self,raw,start):
-		return _DecodeVarint32(raw,start)
-	
 	@gen.coroutine		
 	def _connect(self):
 		self._callbacks = {}
@@ -161,26 +174,13 @@ class HadoopRPC(object):
 		# see org.apache.hadoop.ipc.RetryCache
 		# at least namenode rpc enforce this.
 		# or simply set it to empty
-		header.clientId = 'hrpc-client-next'
+		header.clientId = HadoopRPC.CLIENT_ID
 		return header
 	
-	def _varint(self,value):
-		encoded = []
-		_EncodeVarint(encoded.append,value)
-		return ''.join(encoded)
-
-	def _wrap(self,message):
-		message = message.SerializeToString()
-		message = '%s%s' % (
-			self._varint(len(message)),
-			message,
-		)
-		return message
-
 	@gen.coroutine	
 	def _write(self,payloads):
 		out = ''.join(
-			map(lambda x:self._wrap(x),payloads)
+			map(lambda x:self.wrap(x),payloads)
 		)	
 		yield self._stream.write(
 			''.join([
@@ -262,265 +262,5 @@ class MultiRPC(object):
 
 	def ha_switching(self,response):
 		return False
-
-class Yarn(MultiRPC):
-	def __init__(self,hosts):
-		super(Yarn,self).__init__(hosts)
-
-	@gen.coroutine	
-	def running_applications(self):
-		request = yarn_service_protos_pb2.GetApplicationsRequestProto()
-		request.application_states.extend([
-			yarn_protos_pb2.RUNNING,		
-		]) 
-
-		ok,response = yield self.call(
-			'org.apache.hadoop.yarn.api.ApplicationClientProtocolPB',
-			'getApplications',
-			request,
-			yarn_service_protos_pb2.GetApplicationsResponseProto(),
-		)
-		raise gen.Return(response if ok else [])
-	
-	@gen.coroutine	
-	def move_to_queue(self,application_id,queue):
-		request = yarn_service_protos_pb2.MoveApplicationAcrossQueuesRequestProto()
-		request.application_id.id = application_id['id']
-		request.application_id.cluster_timestamp = application_id['cluster_timestamp']
-		request.target_queue = queue
-	
-		response = yarn_service_protos_pb2.MoveApplicationAcrossQueuesResponseProto()
-		ok,response = yield self.call(
-			'org.apache.hadoop.yarn.api.ApplicationClientProtocolPB',
-			'moveApplicationAcrossQueues',
-			request,
-			response,
-		)
-		raise gen.Return(ok)
-
-	@gen.coroutine
-	def kill(self,application_id):
-		request = yarn_service_protos_pb2.KillApplicationRequestProto()	
-		request.application_id.id = application_id['id']
-		request.application_id.cluster_timestamp = application_id['cluster_timestamp']
-		
-		response = yarn_service_protos_pb2.KillApplicationResponseProto()
-		ok,response = yield self.call(
-			'org.apache.hadoop.yarn.api.ApplicationClientProtocolPB',
-			'forceKillApplication',
-			request,
-			response,
-		)
-
-	@gen.coroutine
-	def application(self,application_id):	
-		request = yarn_service_protos_pb2.GetApplicationReportRequestProto()	
-		request.application_id.id = application_id['id']
-		request.application_id.cluster_timestamp = application_id['cluster_timestamp']
-		
-		response = yarn_service_protos_pb2.GetApplicationReportResponseProto()
-		ok,response = yield self.call(
-			'org.apache.hadoop.yarn.api.ApplicationClientProtocolPB',
-			'getApplicationReport',
-			request,
-			response,
-		)
-			
-		raise gen.Return(response if ok else None)
-	
-	@gen.coroutine
-	def application_attempt(self,application_id,attempt):	
-		request = yarn_service_protos_pb2.GetApplicationAttemptReportRequestProto()	
-		request.application_attempt_id.application_id.id = application_id['id']
-		request.application_attempt_id.application_id.cluster_timestamp = application_id['cluster_timestamp']
-		request.application_attempt_id.attemptId = attempt
-		
-		response = yarn_service_protos_pb2.GetApplicationAttemptReportResponseProto()
-		ok,response = yield self.call(
-			'org.apache.hadoop.yarn.api.ApplicationClientProtocolPB',
-			'getApplicationAttemptReport',
-			request,
-			response,
-		)
-		
-		raise gen.Return(response if ok else None)
-		
-class MRClient(MultiRPC):
-	
-	def __init__(self,hosts,history=False):
-		super(MRClient,self).__init__(hosts)
-		self._protocol = None
-		if history:
-			self._protocol = 'org.apache.hadoop.mapreduce.v2.api.HSClientProtocolPB'
-		else:
-			self._protocol = 'org.apache.hadoop.mapreduce.v2.api.MRClientProtocolPB'
-	
-	@gen.coroutine
-	def jobreport(self,application_id,attempt):
-		request = mr_service_protos_pb2.GetJobReportRequestProto()
-		request.job_id.app_id.id = application_id['id'] 
-		request.job_id.app_id.cluster_timestamp = application_id['cluster_timestamp'] 
-		request.job_id.id = attempt
-	
-		response = mr_service_protos_pb2.GetJobReportResponseProto()	
-		ok,response = yield self.call(
-			self._protocol,
-			'getJobReport',
-			request,
-			response,
-		)
-		
-		raise gen.Return(response if ok else None)
-
-class Namenode(MultiRPC):
-
-	def __init__(self,hosts):
-		super(Namenode,self).__init__(hosts)		
-		self._protocol = 'org.apache.hadoop.hdfs.protocol.ClientProtocol'	
-
-	def ha_switching(self,response):
-		if super(Namenode,self).ha_switching(response):
-			return True
-		
-		ok,response = response
-		if not ok and response.exceptionClassName == 'org.apache.hadoop.ipc.StandbyException':
-			logging.info('namenode ha switch...')
-			return True
-		return False
-	
-	@gen.coroutine	
-	def file_info(self,path):
-		request = ClientNamenodeProtocol_pb2.GetFileInfoRequestProto()
-		request.src = path
-		
-		response = ClientNamenodeProtocol_pb2.GetFileInfoResponseProto()
-		ok,response = yield self.call(
-			self._protocol,
-			'getFileInfo',
-			request,
-			response,
-		)
-		
-		if ok and response.fs.fileId != 0:
-			raise gen.Return(response)	
-		raise gen.Return(None)
-	
-	@gen.coroutine
-	def blocks(self,path,offset,length):
-		request = ClientNamenodeProtocol_pb2.GetBlockLocationsRequestProto()
-		request.src = path
-		request.offset = offset
-		request.length = length
-	
-		response = ClientNamenodeProtocol_pb2.GetBlockLocationsResponseProto()
-		ok,response = yield self.call(
-			self._protocol,
-			'getBlockLocations',
-			request,
-			response,
-		)
-		
-		raise gen.Return(response if ok else None)
-
-	@gen.coroutine
-	def list_dirs(self,path,after_child='',location=False):
-		request = ClientNamenodeProtocol_pb2.GetListingRequestProto()
-		request.src = path
-		request.startAfter = after_child
-		request.needLocation = location
-	
-		response = ClientNamenodeProtocol_pb2.GetListingResponseProto()
-		ok,response = yield self.call(
-			self._protocol,
-			'getListing',
-			request,
-			response,
-		)
-		
-		raise gen.Return(response if ok else None)	
-	
-	@gen.coroutine
-	def list_dirs_all(self,path,each,location=False):
-		after_child = ''
-		while True:
-			response = yield self.list_dirs(path,after_child,False)
-			if response is None:
-				break
-
-			# gen child
-			for entry in response.dirList.partialListing:
-				# update last
-				after_child = entry.path
-				yield each(entry)
-			
-			# more?
-			if response.dirList.remainingEntries <= 0:
-				break
-			
-	@gen.coroutine	
-	def mkdirs(self,path,permission=0x777):
-		request = ClientNamenodeProtocol_pb2.MkdirsRequestProto()
-		request.src = path
-		request.createParent = True
-		request.masked.perm = permission
-
-		response = ClientNamenodeProtocol_pb2.MkdirsResponseProto()
-		ok,response = yield self.call(
-			self._protocol,
-			'mkdirs',
-			request,
-			response,
-		)
-		
-		raise gen.Return(response if ok else None)
-	
-	@gen.coroutine
-	def move(self,source,destination,force=False):
-		request = ClientNamenodeProtocol_pb2.Rename2RequestProto()
-		request.src = source
-		request.dst = destination
-		request.moveToTrash = True
-		request.overwriteDest = force
-	
-		response = ClientNamenodeProtocol_pb2.Rename2ResponseProto()
-		ok,response = yield self.call(
-			self._protocol,
-			'rename2',
-			request,
-			response,
-		)
-		if not ok:
-			logging.warn(response)
-		raise gen.Return(response if ok else None)	
-
-class Namenodes(object):
-	
-	def __init__(self,namenodes):
-		super(Namenodes,self).__init__()
-		self._namenodes = namenodes	
-	
-	def resolve(self,path):
-		path = urlparse(path)
-		if path.scheme != 'hdfs':
-			return None
-		
-		name_service = path.netloc.split(':')[0]	
-		namenode = self._namenodes.get(name_service,None)
-		if namenode is None:
-			return None
-		
-		return namenode
-
-
-
-
-
-
-
-
-
-
-
-
 
 

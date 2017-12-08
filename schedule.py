@@ -164,7 +164,7 @@ def clean_hive_staging_dir(namenodes,dirs):
 			)
 			
 			# process older than a day
-			if now - entry.modification_time > (3600 * 24 * 1000):
+			if now - entry.modification_time > (7 * 3600 * 24 * 1000):
 				trash(namenode,full_path)
 		
 		# do work
@@ -174,13 +174,10 @@ def clean_hive_staging_dir(namenodes,dirs):
 
 @gen.coroutine
 def trash(namenode,candidate):
-	now = int((datetime.now() - datetime(1970,1,1)).total_seconds() * 1000)
-	now = now - (now % (3600 * 24 * 1000))
-
 	parent,file_name = os.path.split(candidate)		
 	
 	trash_root = '/user/hdfs/.Trash/%s%s' % (
-		now,
+		'%s0000' % datetime.now().strftime('%y%m%d%H'),
 		parent,
 	)
 	yield namenode.mkdirs(trash_root)
@@ -237,7 +234,7 @@ def clean_hive_scratch_dir(self,dirs):
 					full_path,
 					child.path,
 				)
-				if now - child.modification_time > (3600 * 24 * 1000):
+				if now - child.modification_time > (7 * 3600 * 24 * 1000):
 					# remove
 					trash(namenode,full)
 			# do work
@@ -278,8 +275,8 @@ if __name__ == '__main__':
 		'hdfs://sfbdp1/tmp/hive',
 	]	
 			
-	IOLoop.current().add_callback(lambda :move_spark_task(yarn))
-	IOLoop.current().add_callback(lambda :evict_large_spark_task(yarn))
+	#IOLoop.current().add_callback(lambda :move_spark_task(yarn))
+	#IOLoop.current().add_callback(lambda :evict_large_spark_task(yarn))
 	IOLoop.current().add_callback(lambda :clean_hive_staging_dir(namenodes,hive_stagings))
 	IOLoop.current().add_callback(lambda :clean_hive_scratch_dir(namenodes,hive_scratch))
 	#IOLoop.current().add_callback(lambda :audit_mr_jobs(mr_history,yarn,namenodes))

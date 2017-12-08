@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# -*- coding: :new utf-8 -*-
+# -*- coding: utf-8 -*-
 
 import logging
 
@@ -11,10 +11,11 @@ from datetime import datetime
 from tornado import gen
 from tornado.ioloop import IOLoop
 
-from nonblocking import Yarn
-from nonblocking import MRClient
-from nonblocking import Namenode
-from nonblocking import Namenodes
+from yarn import Yarn
+from yarn import MRClient
+from hdfs import Namenode
+from hdfs import Namenodes
+from hdfs import Datanode
 
 from gen import hdfs_pb2
 
@@ -120,14 +121,31 @@ def audit_mr_jobs(mr_history,yarn,namenodes):
 				logging.warn('no namenode for job_file:%s' % job)
 				raise gen.Return()
 
-			#TODO			
-			info = yield namenode.file_info(urlparse(job_config).path)
+			job_config_url = urlparse(job_config)			
+			info = yield namenode.file_info(job_config_url.path)
 			if info is None:
 				logging.warn('no job file for application:%s' % attempt)
 				yield gen.Return()
 			
-			blocks = yield namenode.blocks(job_config.path,0,info.fs.length)	
-			logging.info(blocks)
+			#TODO
+			logging.info('%s %s' % (job_config_url.path,info.fs.length))		
+			blocks = yield namenode.blocks(job_config_url.path,0,info.fs.length)	
+			for block in blocks.locations.blocks:
+				logging.info(block)
+				hosts = map(
+					lambda x:(x.id.ipAddr,x.id.xferPort),
+					block.locs,
+				)
+				for host in hosts:
+					datanode = Datanode(host)
+					stream = yield datanode.stream({
+						'block' : block.b.blockId,
+						'pool' : block.b.poolId,
+						'timestamp' : block.b.generationStamp,
+						'length' : block.b.numBytes,
+					})
+					#print (yield stream.read(204800))
+					break
 			exit(0)
 			raise gen.Return()
 	
@@ -164,7 +182,7 @@ def clean_hive_staging_dir(namenodes,dirs):
 			)
 			
 			# process older than a day
-			if now - entry.modification_time > (3600 * 24 * 1000):
+			if now - entry.modification_time > (7 * 3600 * 24 * 1000):
 				trash(namenode,full_path)
 		
 		# do work
@@ -174,13 +192,10 @@ def clean_hive_staging_dir(namenodes,dirs):
 
 @gen.coroutine
 def trash(namenode,candidate):
-	now = int((datetime.now() - datetime(1970,1,1)).total_seconds() * 1000)
-	now = now - (now % (3600 * 24 * 1000))
-
 	parent,file_name = os.path.split(candidate)		
 	
 	trash_root = '/user/hdfs/.Trash/%s%s' % (
-		now,
+		'%s0000' % datetime.now().strftime('%y%m%d%H'),
 		parent,
 	)
 	yield namenode.mkdirs(trash_root)
@@ -237,7 +252,7 @@ def clean_hive_scratch_dir(self,dirs):
 					full_path,
 					child.path,
 				)
-				if now - child.modification_time > (3600 * 24 * 1000):
+				if now - child.modification_time > (7 * 3600 * 24 * 1000):
 					# remove
 					trash(namenode,full)
 			# do work
@@ -278,12 +293,52 @@ if __name__ == '__main__':
 		'hdfs://sfbdp1/tmp/hive',
 	]	
 			
-	IOLoop.current().add_callback(lambda :move_spark_task(yarn))
-	IOLoop.current().add_callback(lambda :evict_large_spark_task(yarn))
-	IOLoop.current().add_callback(lambda :clean_hive_staging_dir(namenodes,hive_stagings))
-	IOLoop.current().add_callback(lambda :clean_hive_scratch_dir(namenodes,hive_scratch))
+	#IOLoop.current().add_callback(lambda :move_spark_task(yarn))
+	#IOLoop.current().add_callback(lambda :evict_large_spark_task(yarn))
+	#IOLoop.current().add_callback(lambda :clean_hive_staging_dir(namenodes,hive_stagings))
+	#IOLoop.current().add_callback(lambda :clean_hive_scratch_dir(namenodes,hive_scratch))
 	#IOLoop.current().add_callback(lambda :audit_mr_jobs(mr_history,yarn,namenodes))
 	
+	@gen.coroutine
+	def callback():
+		"""
+		datanode = Datanode(('10.116.101.44', 50010))
+		stream = yield datanode.stream({'timestamp': 180700178L, 'length': 120834L, 'pool': u'BP-690617512-10.116.100.1-1498291718527', 'block': 1132614535L})
+		"""
+		# /user/ETL_SPMS_CORE/.staging/job_1512123906043_191087/job.xml 188704
+		job_config_url = 'hdfs://sfbdp1/user/ETL_SPMS_CORE/.staging/job_1512123906043_92315/job_1512123906043_92315_1_conf.xml'
+		namenode = namenodes.resolve(job_config_url)
+		
+		job_config_url = urlparse(job_config_url)	
+		info = yield namenode.file_info(job_config_url.path)
+		
+		contents = []
+		blocks = yield namenode.blocks(job_config_url.path,0,info.fs.length)
+		for block in blocks.locations.blocks:
+			hosts = map(
+				lambda x:(x.id.ipAddr,x.id.xferPort),
+				block.locs,
+			)
+			for host in hosts:
+				datanode = Datanode(host)
+				stream = yield datanode.stream({
+					'block' : block.b.blockId,
+					'pool' : block.b.poolId,
+					'timestamp' : block.b.generationStamp,
+					'length' : block.b.numBytes,
+				})
+				while True:
+					content = yield stream.read(1024)
+					if content is None:
+						#stream.close()
+						break;
+					contents.append(content)
+				break
+		with open('out.xml','w') as f:
+			f.write(''.join(contents))
+		#logging.info(''.join(contents))
+		exit()
+	IOLoop.current().add_callback(callback)
 	IOLoop.current().start()
 
 
