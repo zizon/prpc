@@ -5,7 +5,6 @@ import logging
 
 import struct
 
-from collections import deque
 from urlparse import urlparse
 
 from tornado import gen
@@ -18,6 +17,7 @@ from nonblocking import ProtocolBuffer
 
 from streams import BufferedStream
 from streams import ClosableStream
+from streams import SwitchableStream
 
 from gen import ClientNamenodeProtocol_pb2
 from gen import datatransfer_pb2
@@ -146,10 +146,10 @@ class Namenode(MultiRPC):
 	@gen.coroutine
 	def stream(self,path):
 		file_info = yield self.file_info(path)
-		blocks = deque((yield self.blocks(path,0,file_info.fs.length)).locations.blocks)
-		
+		blocks = [ x for x in (yield self.blocks(path,0,file_info.fs.length)).locations.blocks ]
+		blocks.sort(key=lambda x:x.offset,reverse=True)
+	
 		def next_stream(this,current):
-			logging.info('close one')
 			if current is not None:
 				current.close()
 			
@@ -161,12 +161,22 @@ class Namenode(MultiRPC):
 				lambda x:(x.id.ipAddr,x.id.xferPort),
 				block.locs,
 			)
-			return Datanode(hosts[0]).stream({
-					'block' : block.b.blockId,
-					'pool' : block.b.poolId,
-					'timestamp' : block.b.generationStamp,
-					'length' : block.b.numBytes,
-				})
+			
+			lazy_stream = lambda host,block: \
+					lambda : Datanode(host).stream({
+						'block' : block.b.blockId,
+						'pool' : block.b.poolId,
+						'timestamp' : block.b.generationStamp,
+						'length' : block.b.numBytes,
+						'offset' : 0,
+					})
+			return SwitchableStream(map(
+				(lambda block: \
+					lambda host:
+						lazy_stream(host,block)
+				)(block),
+				hosts,
+			))
 		
 		raise gen.Return(_BoundedMultiStream(
 			None,
@@ -214,7 +224,7 @@ class Datanode(ProtocolBuffer):
 		
 		# then payload
 		payload = datatransfer_pb2.OpReadBlockProto()
-		payload.offset = 0
+		payload.offset = block['offset']
 		payload.len = block['length']
 		payload.sendChecksums = False
 		payload.header.clientName = HadoopRPC.CLIENT_ID 
@@ -230,7 +240,6 @@ class Datanode(ProtocolBuffer):
 		
 		stream = None
 		try:
-
 			# establish connection
 			ioloop = self._ioloop if self._ioloop is not None else IOLoop.current() 
 			stream = BufferedStream((yield TCPClient(io_loop=ioloop).connect(*self._host)))
@@ -253,15 +262,18 @@ class Datanode(ProtocolBuffer):
 						block,
 						response,
 				))
-			
+				
 			raise gen.Return(
-				_BoundedMultiStream(
+				_BlockStream(
+					self,
+					block,
 					stream,
-					block['length'],
 					lambda self,_:_PacketStream(self.stream()),
 				)
 			)
-		except not gen.Return:
+		except gen.Return as result:
+			raise result
+		except:
 			logging.exception('unexpected io excetion,close stream for%s'%(
 				str(self._host),
 			))
@@ -296,11 +308,11 @@ class _PacketStream(ClosableStream):
 		partial = yield stream.read(6)
 		payload_length = struct.unpack('!I',partial[:4])[0]
 		header_length = struct.unpack('!H',partial[4:])[0]
-		
+	
 		# parse header
 		header = datatransfer_pb2.PacketHeaderProto()
 		header.ParseFromString((yield stream.read(header_length)))
-		
+	
 		# calculate checksum length
 		checksum_length = payload_length - 4 - header.dataLen 	
 		
@@ -349,8 +361,46 @@ class _BoundedMultiStream(ClosableStream):
 		# did read something,update trackers
 		self._remainds -= len(content)
 		raise gen.Return(content)
+	
+	def limit(self,logical_length):
+		self._remainds = logical_length	
+	
+	def remainds(self):
+		return self._remainds
+	
+class _BlockStream(_BoundedMultiStream):
+	
+	def __init__(self,datanode,block,buffered_stream,next_stream=None):
+		super(_BlockStream,self).__init__(buffered_stream,block['length'],next_stream)
 		
+		# copy config
+		self._block = dict(block)	
+		self._datanode = datanode
+	
+	@gen.coroutine
+	def seek(self,offset):
+		current = self.stream()
+		if current is not None:
+			current.close()
+		
+		# update block info
+		block = self._block
+		block['length'] = block['length'] - (offset - block['offset'])
+		block['offset'] = offset
+		self._block = block
 
+		# reconnect
+		block_stream = yield self._datanode.stream(self._block)
+		
+		# steal it
+		current = block_stream.stream()
+		
+		# switch
+		block_stream.switch(None)
+		block_stream.close()
 
-
+		self.switch(current)
+		
+		# update limit
+		self.limit(self._block['length'] - offset)
 

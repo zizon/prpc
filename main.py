@@ -307,6 +307,7 @@ if __name__ == '__main__':
 		"""
 		# /user/ETL_SPMS_CORE/.staging/job_1512123906043_191087/job.xml 188704
 		job_config_url = 'hdfs://sfbdp1/user/ETL_SPMS_CORE/.staging/job_1512123906043_92315/job_1512123906043_92315_1_conf.xml'
+		job_config_url = 'hdfs://sfbdp1/user/hive/warehouse/tmp_o2o.db/tt_order_state/000000_0'
 		namenode = namenodes.resolve(job_config_url)
 		
 		job_config_url = urlparse(job_config_url)	
@@ -314,17 +315,46 @@ if __name__ == '__main__':
 		logging.info(info)	
 		blocks = yield namenode.blocks(job_config_url.path,0,info.fs.length)
 		stream = yield namenode.stream(job_config_url.path)
-		contents = []
-		while True:
-			content = yield stream.read(1024)
-			if content is None:
-				break;
-			contents.append(content)
-		with open('out.xml','w') as f:
-			f.write(''.join(contents))
-		logging.info(''.join(contents))
+		with open('out','w') as f:
+			while True:
+				content = yield stream.read(1024)
+				if content is None:
+					break;
+				f.write(content)
 		exit()
+
+	@gen.coroutine
+	def callback2():
+		job_config_url = 'hdfs://sfbdp1/user/hive/warehouse/tmp_o2o.db/tt_order_state/000000_0'
+		namenode = namenodes.resolve(job_config_url)
+		
+		job_config_url = urlparse(job_config_url)	
+		info = yield namenode.file_info(job_config_url.path)
+		logging.info(info)	
+		blocks = yield namenode.blocks(job_config_url.path,0,info.fs.length)
+		
+		block = blocks.locations.blocks[0]
+		#logging.info(block)
+		datanode = Datanode((block.locs[0].id.ipAddr,block.locs[0].id.xferPort))
+		stream = yield datanode.stream({
+			'block' : block.b.blockId,
+			'pool' : block.b.poolId,
+			'timestamp' : block.b.generationStamp,
+			'length' : block.b.numBytes,
+			'offset' : 0,
+		})
+			
+		logging.info('try seek...')
+		yield stream.seek(100)
+
+		logging.info('try read....')
+		yield stream.read(100)
+		
+		logging.info('done')
+		
+		exit(0)
 	IOLoop.current().add_callback(callback)
+	#IOLoop.current().add_callback(callback2)
 	IOLoop.current().start()
 
 
