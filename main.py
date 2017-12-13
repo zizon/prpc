@@ -162,8 +162,20 @@ def audit_mr_jobs(mr_history,yarn,namenodes):
 
 @gen.coroutine
 def clean_hive_staging_dir(namenodes,dirs):
+	def exclude(entry):
+		return os.path.split(entry)[-1].startswith('.hive-staging_hive')
+	
+	yield clean_dir(namenodes,dirs,exclude,7 * 3600 * 24 * 1000)
+			
+	IOLoop.current().call_later(5,clean_hive_staging_dir,namenodes,dirs)
+
+@gen.coroutine
+def clean_dir(namenodes,dirs,exclude,expire):
 	now = int((datetime.now() - datetime(1970,1,1)).total_seconds() * 1000)
-	logging.info('trigger clean_hive_staging_dir... %s' % datetime.fromtimestamp(now/1000))
+	logging.info('trigger clean_dir...%s at %s' % (
+		dirs,
+		datetime.fromtimestamp(now/1000)
+	))
 	for candidate in dirs:
 		namenode = namenodes.resolve(candidate)
 		if namenode is None:
@@ -173,7 +185,7 @@ def clean_hive_staging_dir(namenodes,dirs):
 		
 		@gen.coroutine	
 		def each(entry):
-			if not os.path.split(entry.path)[-1].startswith('.hive-staging_hive'):
+			if exclude(entry.path):
 				raise gen.Return()
 
 			full_path = '%s/%s' % (
@@ -182,13 +194,12 @@ def clean_hive_staging_dir(namenodes,dirs):
 			)
 			
 			# process older than a day
-			if now - entry.modification_time > (7 * 3600 * 24 * 1000):
+			if now - entry.modification_time > expire:
+				logging.info('remove %s' % full_path)
 				trash(namenode,full_path)
 		
 		# do work
 		yield namenode.list_dirs_all(urlparse(candidate).path,each)
-			
-	IOLoop.current().call_later(5,clean_hive_staging_dir,namenodes,dirs)
 
 @gen.coroutine
 def trash(namenode,candidate):
@@ -216,7 +227,7 @@ def trash(namenode,candidate):
 	))
 
 @gen.coroutine
-def clean_hive_scratch_dir(self,dirs):
+def clean_hive_scratch_dir(namenodes,dirs):
 	now = int((datetime.now() - datetime(1970,1,1)).total_seconds() * 1000)
 	logging.info('trigger clean_hive_scratch_dir... %s' % datetime.fromtimestamp(now/1000))	
 	for candidate in dirs:
@@ -256,6 +267,9 @@ def clean_hive_scratch_dir(self,dirs):
 					# remove
 					trash(namenode,full)
 			# do work
+			def exclude(entry):	
+				sample = '0034a069-f4f7-4cdf-855a-c7513a2e8e3f'
+				return len(sample) != len(entry.path) and len(sample.split('-')) != len(entry.path.split('-'))
 			yield namenode.list_dirs_all(full_path,uuid)
 		# do work
 		yield namenode.list_dirs_all(urlparse(candidate).path,each)
@@ -352,8 +366,11 @@ if __name__ == '__main__':
 		
 		logging.info('done')
 		
-		exit(0)
-	IOLoop.current().add_callback(callback)
+		exit(0)	
+	def exclude(path):
+		return 'inpregress' in path
+	#IOLoop.current().add_callback(lambda :clean_dir(namenodes,['hdfs://sfbdp1/user/spark/applicationHistory'],exclude))	
+	#IOLoop.current().add_callback(callback)
 	#IOLoop.current().add_callback(callback2)
 	IOLoop.current().start()
 
